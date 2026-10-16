@@ -1,5 +1,6 @@
 import { createInterface, type Interface } from "node:readline/promises";
 import { stdin, stdout } from "node:process";
+import { DatabaseSync } from "node:sqlite";
 
 /**
  * An error handling class for validation errors.
@@ -13,77 +14,23 @@ class ValidationError extends Error {
 }
 
 /**
- * Represents a budget category with a name and subcategories.
+ * Represents a category stored in the categories table.
  */
-class Category {
-    private readonly subcategories: Category[] = [];
-    
-    /** Creates a new category with the given name. */
-    constructor(readonly name: string) {}
-
-    /**
-     * Returns the subcategories of this category.
-     */
-    get children(): readonly Category[] {
-        return this.subcategories;
-    }
-
-    /**
-     * Adds a subcategory to this category.
-     */
-    addSubcategory(subcategory: Category): void {
-        this.subcategories.push(subcategory);
-    }
-}
+type Category = { id: number; name: string };
 
 /**
- * Wraps the recursive case insensitive name search for a category.
+ * Represents a financial entry from the entries table, either an income or an expense, with the name of its category.
  */
-function findCategory(nodes: readonly Category[], name: string): Category | undefined {
-    // Normalizes the name to lowercase, trims and finds the category recursively.
-    return findByLoweredName(nodes, name.trim().toLowerCase());
-}
+type Entry = { id: number; kind: string; amount: number; description: string; date: string; category: string };
 
 /**
- * Recursively searches for a category by its name ignoring case.
+ * Validates that the amount is a positive number.
  */
-function findByLoweredName(nodes: readonly Category[], loweredName: string): Category | undefined {
-    for (const node of nodes) {
-        if (node.name.toLowerCase() === loweredName) {
-            return node;
-        }
-        const found = findByLoweredName(node.children, loweredName);
-        if (found !== undefined) {
-            return found;
-        }
+function assertValidAmount(amount: number): number {
+    if (!Number.isFinite(amount) || amount <= 0) {
+        throw new ValidationError("Amount must be a positive number.");
     }
-    return undefined;
-}
-
-/**
- * Represents a financial entry, either an income or an expense.
- */
-abstract class Entry {
-    readonly amount: number;
-    readonly description: string;
-    readonly date: string;
-    readonly categoryName: string;
-
-    /** Builds a valid Entry with a positive amount, description, date, and category. */
-    constructor(amount: number, description: string, date: string, categoryName: string) {
-        if (!Number.isFinite(amount) || amount <= 0) {
-            throw new ValidationError("Amount must be a positive number.");
-        }
-        this.amount = amount;
-        this.description = assertValidDescription(description);
-        this.date = date;
-        this.categoryName = categoryName;
-    }
-
-    /**
-     * The signed value of the entry amount. Income adds to the Balance, Expense subtracts and the Ledger sums these to get the Balance.
-     */
-    abstract signedAmount(): number;
+    return amount;
 }
 
 /**
@@ -98,53 +45,44 @@ function assertValidDescription(input: string): string {
 }
 
 /**
- * Represents an expense entry.
- */
-class Expense extends Entry {
-
-    /** Returns this Expense as a negative amount for totals. */
-    signedAmount(): number {
-        return -this.amount;
-    }
-}
-
-/**
- * Represents an income entry.
- */
-class Income extends Entry {
-    /** Returns this Income as a positive amount for totals. */
-    signedAmount(): number {
-        return this.amount;
-    }
-}
-
-/**
- * Represents a ledger that tracks financial entries and categories.
+ * Represents a ledger that tracks financial entries and categories in a SQLite database.
  */
 class Ledger {
-    private readonly entries: Entry[] = [];
-    private readonly categories: Category[] = [];
+    private readonly db: DatabaseSync;
 
-    /**
-     * Uses the findCategory function to find a category by name (recursively and case insensitive).
-     */
-    private findCategoryByName(name: string): Category | undefined {
-        return findCategory(this.categories, name);
+    /** Opens the database file and creates the categories and entries tables if they don't exist yet. */
+    constructor(fileName: string) {
+        this.db = new DatabaseSync(fileName);
+        this.db.exec(`
+            CREATE TABLE IF NOT EXISTS categories (
+                id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                parent_id INTEGER REFERENCES categories(id)
+            );
+            CREATE TABLE IF NOT EXISTS entries (
+                id INTEGER PRIMARY KEY,
+                kind TEXT NOT NULL,
+                amount REAL NOT NULL,
+                description TEXT NOT NULL,
+                date TEXT NOT NULL,
+                category_id INTEGER NOT NULL REFERENCES categories(id)
+            );
+        `);
     }
 
     /**
-     * Requires a category by name using findCategoryByName. Throws a ValidationError if it isn't found.
+     * Requires a category by name using a SELECT query (case insensitive). Throws a ValidationError if it isn't found.
      */
     requireCategory(name: string): Category {
         const trimmed = name.trim();
         if (trimmed.length === 0) {
             throw new ValidationError("Category name is required.");
         }
-        const found = this.findCategoryByName(trimmed);
-        if (found === undefined) {
+        const category = this.db.prepare("SELECT id, name FROM categories WHERE name = ?").get(trimmed) as Category | undefined;
+        if (category === undefined) {
             throw new ValidationError(`Category '${trimmed}' does not exist.`);
         }
-        return found;
+        return category;
     }
 
     /**
@@ -155,70 +93,89 @@ class Ledger {
         if (trimmed.length === 0) {
             throw new ValidationError("Category name is required.");
         }
-        if (this.findCategoryByName(trimmed) !== undefined) {
+        if (this.db.prepare("SELECT id FROM categories WHERE name = ?").get(trimmed) !== undefined) {
             throw new ValidationError(`Category '${trimmed}' already exists.`);
         }
         return trimmed;
     }
 
     /**
-     * Adds a new category to the ledger. If a parent category name is provided, the new category is added as a subcategory of the parent.
+     * Adds a new category to the database. If a parent category name is provided, the new category is added as a subcategory of the parent.
      */
-    addCategory(name: string, parentName?: string): Category {
-        const category = new Category(this.assertAvailableCategoryName(name));
-        if (parentName === undefined || parentName.trim() === "") {
-            this.categories.push(category);
-        } else {
-            this.requireCategory(parentName).addSubcategory(category);
+    addCategory(name: string, parentName: string): string {
+        const trimmed = this.assertAvailableCategoryName(name);
+        const parentId = parentName.trim() === "" ? null : this.requireCategory(parentName).id;
+        this.db.prepare("INSERT INTO categories (name, parent_id) VALUES (?, ?)").run(trimmed, parentId);
+        return trimmed;
+    }
+
+    /**
+     * Adds a new expense or income entry to the database while ensuring the category exists.
+     */
+    addEntry(kind: "expense" | "income", amount: number, description: string, date: string, categoryName: string): void {
+        const category = this.requireCategory(categoryName);
+        this.db.prepare("INSERT INTO entries (kind, amount, description, date, category_id) VALUES (?, ?, ?, ?, ?)")
+            .run(kind, assertValidAmount(amount), assertValidDescription(description), date, category.id);
+    }
+
+    /**
+     * Updates the amount and description of an entry in the database. Throws a ValidationError if it isn't found.
+     */
+    editEntry(id: number, amount: number, description: string): void {
+        const result = this.db.prepare("UPDATE entries SET amount = ?, description = ? WHERE id = ?")
+            .run(assertValidAmount(amount), assertValidDescription(description), id);
+        if (result.changes === 0) {
+            throw new ValidationError(`Entry ${id} does not exist.`);
         }
-        return category;
     }
 
-    /** 
-     * Adds a new expense entry to the ledger while ensuring the category exists. 
+    /**
+     * Deletes an entry from the database. Throws a ValidationError if it isn't found.
      */
-    addExpense(amount: number, description: string, date: string, categoryName: string): void {
-        const category = this.requireCategory(categoryName);
-        const expense = new Expense(amount, description, date, category.name);
-        this.entries.push(expense);
-    }
-
-    /** 
-     * Adds a new income entry to the ledger while ensuring the category exists. 
-     */
-    addIncome(amount: number, description: string, date: string, categoryName: string): void {
-        const category = this.requireCategory(categoryName);
-        const income = new Income(amount, description, date, category.name);
-        this.entries.push(income);
+    deleteEntry(id: number): void {
+        const result = this.db.prepare("DELETE FROM entries WHERE id = ?").run(id);
+        if (result.changes === 0) {
+            throw new ValidationError(`Entry ${id} does not exist.`);
+        }
     }
 
     /**
      * Calculates the total amount for a given category, including its subcategories.
      */
-    categoryTotal(category: Category): number {
-        const ownTotal = this.entries.filter(entry => entry.categoryName === category.name).reduce((total, entry) => total + entry.signedAmount(), 0);
-        return category.children.reduce((total, child) => total + this.categoryTotal(child), ownTotal);
+    categoryTotal(categoryId: number): number {
+        const own = this.db.prepare("SELECT SUM(CASE WHEN kind = 'income' THEN amount ELSE -amount END) AS total FROM entries WHERE category_id = ?")
+            .get(categoryId) as { total: number | null };
+        const children = this.db.prepare("SELECT id FROM categories WHERE parent_id = ?").all(categoryId) as { id: number }[];
+        return children.reduce((total, child) => total + this.categoryTotal(child.id), own.total ?? 0);
     }
 
     /**
      * Returns the balance of the ledger by summing all entries.
      */
     balance(): number {
-        return this.entries.reduce((total, entry) => total + entry.signedAmount(), 0);
+        const row = this.db.prepare("SELECT SUM(CASE WHEN kind = 'income' THEN amount ELSE -amount END) AS total FROM entries")
+            .get() as { total: number | null };
+        return row.total ?? 0;
     }
 
     /**
      * Returns true if the ledger has any entries. If it doesn't it returns false.
      */
     hasEntries(): boolean {
-        return this.entries.length > 0;
+        const row = this.db.prepare("SELECT COUNT(*) AS count FROM entries").get() as { count: number };
+        return row.count > 0;
     }
 
     /**
-     * Returns all entries in the ledger.
+     * Returns all entries in the ledger, joined with the categories table to get the name of each category.
      */
-    get allEntries(): readonly Entry[] {
-        return this.entries;
+    allEntries(): Entry[] {
+        return this.db.prepare(`
+            SELECT entries.id, entries.kind, entries.amount, entries.description, entries.date, categories.name AS category
+            FROM entries
+            JOIN categories ON entries.category_id = categories.id
+            ORDER BY entries.id
+        `).all() as Entry[];
     }
 }
 
@@ -228,8 +185,8 @@ class Ledger {
 async function promptCategory(rl: Interface, ledger: Ledger): Promise<void> {
     const name = await rl.question("Category name: ");
     const parentName = await rl.question("Parent category (blank for none): ");
-    const category = ledger.addCategory(name, parentName);
-    console.log(`Added category '${category.name}'.`);
+    const added = ledger.addCategory(name, parentName);
+    console.log(`Added category '${added}'.`);
 }
 
 /**
@@ -241,11 +198,7 @@ async function promptEntry(rl: Interface, ledger: Ledger, kind: "expense" | "inc
     const categoryName = await rl.question("Category: ");
     const today = new Date().toISOString().slice(0, 10);
 
-    if (kind === "expense") {
-        ledger.addExpense(amount, description, today, categoryName);
-    } else {
-        ledger.addIncome(amount, description, today, categoryName);
-    }
+    ledger.addEntry(kind, amount, description, today, categoryName);
     console.log(`Balance: $${ledger.balance().toFixed(2)}`);
 }
 
@@ -258,7 +211,27 @@ async function promptCategoryTotal(rl: Interface, ledger: Ledger): Promise<void>
         return;
     }
     const category = ledger.requireCategory(await rl.question("Category: "));
-    console.log(`${category.name} total: $${ledger.categoryTotal(category).toFixed(2)}`);
+    console.log(`${category.name} total: $${ledger.categoryTotal(category.id).toFixed(2)}`);
+}
+
+/**
+ * Asks for an entry id and its new amount and description and updates it in the ledger.
+ */
+async function promptEditEntry(rl: Interface, ledger: Ledger): Promise<void> {
+    const id = Number(await rl.question("Entry id: "));
+    const amount = Number(await rl.question("New amount in dollars: "));
+    const description = await rl.question("New description: ");
+    ledger.editEntry(id, amount, description);
+    console.log(`Updated entry ${id}.`);
+}
+
+/**
+ * Asks for an entry id and deletes it from the ledger.
+ */
+async function promptDeleteEntry(rl: Interface, ledger: Ledger): Promise<void> {
+    const id = Number(await rl.question("Entry id: "));
+    ledger.deleteEntry(id);
+    console.log(`Deleted entry ${id}.`);
 }
 
 /**
@@ -269,8 +242,8 @@ function printEntries(ledger: Ledger): void {
         console.log("No entries yet.");
         return;
     }
-    for (const entry of ledger.allEntries) {
-        console.log(`${entry.date}  ${entry.categoryName}  ${entry.description}  $${entry.signedAmount().toFixed(2)}`);
+    for (const entry of ledger.allEntries()) {
+        console.log(`${entry.id}  ${entry.date}  ${entry.kind}  ${entry.category}  ${entry.description}  $${entry.amount.toFixed(2)}`);
     }
 }
 
@@ -279,11 +252,11 @@ function printEntries(ledger: Ledger): void {
  */
 async function main(): Promise<void> {
     const rl = createInterface({ input: stdin, output: stdout });
-    const ledger = new Ledger();
+    const ledger = new Ledger("budget.db");
 
     while (true) {
-        const choice = (await rl.question("\n1) Add category  2) Add expense  3) Add income  4) Balance  5) Category Total  6) List entries  7) Quit\n> ")).trim();
-        if (choice === "7") {
+        const choice = (await rl.question("\n1) Add category  2) Add expense  3) Add income  4) Balance  5) Category Total  6) List entries  7) Edit entry  8) Delete entry  9) Quit\n> ")).trim();
+        if (choice === "9") {
             break;
         }
         try {
@@ -299,8 +272,12 @@ async function main(): Promise<void> {
                 await promptCategoryTotal(rl, ledger);
             } else if (choice === "6") {
                 printEntries(ledger);
+            } else if (choice === "7") {
+                await promptEditEntry(rl, ledger);
+            } else if (choice === "8") {
+                await promptDeleteEntry(rl, ledger);
             } else {
-                console.log("Please choose 1-7.");
+                console.log("Please choose 1-9.");
             }
         } catch (error) {
             if (!(error instanceof ValidationError)) {
